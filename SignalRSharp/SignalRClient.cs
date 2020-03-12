@@ -16,10 +16,10 @@ namespace Appie
         /// Maximum number of retries. If set to 0, there is no limit. (The default value is 5.)
         /// </summary>
         public int MaxRetry { get; set; } = 5;
+        public int RetryCount { get; private set; } = 0;
 
         private volatile bool Running;
         private bool AutomaticRetry = false;
-        private int RetryFailedCount = 0;
 
         public HubConnection Connection { get; private set; }
         public event SignalRDelegate.SRAction Connecting;
@@ -28,8 +28,7 @@ namespace Appie
         public event SignalRDelegate.SRException Reconnected;
         public event SignalRDelegate.SRException Closed;
         public event SignalRDelegate.SRException Exception;
-        public event SignalRDelegate.SRException Stoped;
-        public event SignalRDelegate.SRException RetryFailed;
+        public event SignalRDelegate.SRException Failed;
 
         #region Constructors
         public SignalRClient(string url)
@@ -75,35 +74,46 @@ namespace Appie
         }
         #endregion
 
+        protected void HandleClosed(Exception exception)
+        {
+            Closed?.Invoke(this, exception);
+            RetryCount = 0;
+            Running = false;
+        }
+
+        protected void HandleFailed(Exception exception)
+        {
+            Failed?.Invoke(this, exception);
+            RetryCount = 0;
+            Running = false;
+        }
+
         protected void InitConnection()
         {
             Connection.Closed += ex0 => Task.Run(() =>
             {
-                Running = false;
-
                 if (ex0 == null || !AutomaticRetry)
                 {
-                    Closed?.Invoke(this, ex0);
+                    HandleClosed(ex0);
                     return;
                 }
 
                 Exception?.Invoke(this, ex0);
                 Thread.Sleep(ExceptionRetryDelay);
-                Reconnecting?.Invoke(this, ex0);
                 try
                 {
-                    StartAsync(AutomaticRetry).Wait();
+                    Running = false;
+                    StartAsync(AutomaticRetry, ex0).Wait();
                     Reconnected?.Invoke(this, ex0);
-                    RetryFailedCount = 0;
                 }
                 catch (Exception ex)
                 {
-                    Closed?.Invoke(this, ex);
+                    HandleClosed(ex);
                 }
             });
         }
 
-        public async Task StartAsync(bool automaticRetry)
+        public async Task StartAsync(bool automaticRetry, Exception exception = null)
         {
             if (Running) throw new InvalidOperationException("The SignalR client is running.");
             Running = true;
@@ -113,32 +123,29 @@ namespace Appie
             {
                 while (true)
                 {
-                    Connecting?.Invoke(this);
+                    if (exception is null)
+                        Connecting?.Invoke(this);
+                    else Reconnecting?.Invoke(this, exception);
+
                     try
                     {
                         Connection.StartAsync().Wait();
                         Connected?.Invoke(this);
-                        RetryFailedCount = 0;
+                        RetryCount = 0;
                         return;
                     }
                     catch (Exception ex)
                     {
+                        RetryCount++;
                         Exception?.Invoke(this, ex);
-                        if (AutomaticRetry)
+                        if (!AutomaticRetry || RetryCount >= MaxRetry)
                         {
-                            if (RetryFailedCount < MaxRetry)
-                            {
-                                Thread.Sleep(ExceptionRetryDelay);
-                                RetryFailedCount++;
-                                continue;
-                            }
-                            else
-                            {
-                                RetryFailed?.Invoke(this, ex);
-                                throw;
-                            }
+                            HandleFailed(ex);
+                            throw;
                         }
-                        else throw;
+
+                        Thread.Sleep(ExceptionRetryDelay);
+                        continue;
                     }
                 }
             });
